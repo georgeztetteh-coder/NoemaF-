@@ -1,10 +1,27 @@
-import Anthropic from '@anthropic-ai/sdk'
 import { getCensusData } from '../../lib/census'
 import { createClient } from '@supabase/supabase-js'
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+// OpenRouter client - drop-in OpenAI-compatible API
+async function callAI(prompt) {
+  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
+      'Content-Type': 'application/json',
+      'HTTP-Referer': 'https://noema.vercel.app',
+      'X-Title': 'Noema Underwriting'
+    },
+    body: JSON.stringify({
+      model: 'anthropic/claude-sonnet-4-5',
+      max_tokens: 1000,
+      messages: [{ role: 'user', content: prompt }]
+    })
+  })
+  const data = await response.json()
+  if (!response.ok) throw new Error(data.error?.message || 'OpenRouter error')
+  return data.choices[0].message.content
+}
 
-// Server-side Supabase client with service role for writing assessments
 const supabaseAdmin = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -28,10 +45,8 @@ export default async function handler(req, res) {
   }
 
   try {
-    // Step 1: Pull real Census data for this ZIP code
     const censusData = zip ? await getCensusData(zip) : null
 
-    // Step 2: Build prompt with Census context enrichment
     const name = [firstName, lastName].filter(Boolean).join(' ') || 'Applicant'
     const debtToIncome = income ? ((parseFloat(existingDebt || 0) / parseFloat(income)) * 100).toFixed(1) : 'N/A'
     const monthlyIncome = income ? (parseFloat(income) / 12).toFixed(0) : 'N/A'
@@ -80,17 +95,10 @@ Return ONLY this JSON structure:
   "censusEnriched": ${censusData ? 'true' : 'false'}
 }`
 
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1000,
-      messages: [{ role: 'user', content: prompt }]
-    })
-
-    const raw = response.content.map(b => b.text || '').join('')
+    const raw = await callAI(prompt)
     const clean = raw.replace(/```json|```/g, '').trim()
     const result = JSON.parse(clean)
 
-    // Step 3: Save assessment to Supabase
     const assessment = {
       firm_id: firmId || null,
       applicant_name: name,
@@ -122,10 +130,7 @@ Return ONLY this JSON structure:
       .select()
       .single()
 
-    if (dbError) {
-      console.error('DB save error:', dbError)
-      // Don't fail the request if DB save fails — still return result
-    }
+    if (dbError) console.error('DB save error:', dbError)
 
     return res.status(200).json({
       ...result,
